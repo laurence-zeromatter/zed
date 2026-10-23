@@ -1436,9 +1436,18 @@ impl PickerDelegate for BranchListDelegate {
             };
 
             let mut matches: Vec<Entry> = if query.is_empty() {
+                // A branch whose upstream was deleted (merged PR) is usually dead, and prune never
+                // removes local branches. Keep it out of the default list; a typed query still finds it.
+                let upstream_gone = |branch: &Branch| {
+                    !branch.is_head
+                        && branch
+                            .upstream
+                            .as_ref()
+                            .is_some_and(|upstream| upstream.tracking.is_gone())
+                };
                 let mut matches: Vec<Entry> = all_branches
                     .iter()
-                    .filter(|branch| branch_matches_filter(branch))
+                    .filter(|branch| branch_matches_filter(branch) && !upstream_gone(branch))
                     .map(|branch| Entry::Branch {
                         branch: branch.clone(),
                         positions: Vec::new(),
@@ -2402,6 +2411,69 @@ mod tests {
     ) -> (Entity<Project>, Entity<Repository>) {
         let (_, project, repository) = init_fake_repository_with_fs(cx).await;
         (project, repository)
+    }
+
+    #[gpui::test]
+    async fn test_branches_with_gone_upstream_are_hidden_until_searched(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let with_gone_upstream = |name: &str, is_head: bool| {
+            let mut branch = create_test_branch_with_upstream(
+                name,
+                is_head,
+                None,
+                Some(1000),
+                Some(&format!("refs/remotes/origin/{name}")),
+            );
+            if let Some(upstream) = branch.upstream.as_mut() {
+                upstream.tracking = UpstreamTracking::Gone;
+            }
+            branch
+        };
+        let branches = vec![
+            with_gone_upstream("current-merged", true),
+            with_gone_upstream("old-merged", false),
+            create_test_branch_with_upstream(
+                "live",
+                false,
+                None,
+                Some(900),
+                Some("refs/remotes/origin/live"),
+            ),
+            create_test_branch("never-pushed", false, None, Some(800)),
+        ];
+        let (branch_list, mut ctx) = init_branch_list_test(None, branches, cx).await;
+        let cx = &mut ctx;
+
+        let match_names = |query: &str, cx: &mut VisualTestContext| {
+            branch_list
+                .update_in(cx, |branch_list, window, cx| {
+                    branch_list.picker.update(cx, |picker, cx| {
+                        picker.delegate.update_matches(query.to_string(), window, cx)
+                    })
+                })
+                .detach();
+            cx.run_until_parked();
+            branch_list.update(cx, |branch_list, cx| {
+                branch_list
+                    .picker
+                    .read(cx)
+                    .delegate
+                    .matches
+                    .iter()
+                    .filter(|entry| !entry.is_new_branch())
+                    .map(|entry| entry.name().to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        let default_list = match_names("", cx);
+        assert!(!default_list.contains(&"old-merged".to_string()));
+        assert!(default_list.contains(&"current-merged".to_string()));
+        assert!(default_list.contains(&"live".to_string()));
+        assert!(default_list.contains(&"never-pushed".to_string()));
+
+        assert_eq!(match_names("old-merged", cx), vec!["old-merged".to_string()]);
     }
 
     #[gpui::test]

@@ -30,7 +30,7 @@ use fs::Fs;
 use futures::{
     FutureExt,
     channel::{mpsc, oneshot},
-    future::Shared,
+    future::{self, Either, Shared},
     stream::FuturesUnordered,
 };
 use futures::{StreamExt, stream};
@@ -74,7 +74,53 @@ const TOOL_CALL_INTERRUPTED_BY_FOLLOW_UP_MESSAGE: &str =
     "Permission denied: user sent a follow-up message instead of approving the tool call.";
 pub(crate) const FOLLOW_UP_PERMISSION_DENIED_OPTION_ID: &str = "follow_up_permission_denied";
 pub const MAX_TOOL_NAME_LENGTH: usize = 64;
-pub const MAX_SUBAGENT_DEPTH: u8 = 1;
+pub const MAX_SUBAGENT_DEPTH: u8 = 2;
+/// A subagent's turn is stopped when its model stream goes silent this long, so the parent gets
+/// an error it can act on instead of waiting on a dead connection.
+pub(crate) const SUBAGENT_STALL_TIMEOUT: Duration = Duration::from_secs(180);
+const REPETITION_WINDOW_BYTES: usize = 1024;
+const MAX_REPETITION_PERIOD_BYTES: usize = 64;
+
+fn is_model_response(event: &LanguageModelCompletionEvent) -> bool {
+    match event {
+        LanguageModelCompletionEvent::Text(text) => !text.trim().is_empty(),
+        LanguageModelCompletionEvent::ToolUse(_)
+        | LanguageModelCompletionEvent::ToolUseJsonParseError { .. }
+        | LanguageModelCompletionEvent::Stop(_) => true,
+        _ => false,
+    }
+}
+
+/// Detects a model stuck emitting one short pattern, e.g. `</parameter></invoke>` thousands of
+/// times after a tool call leaked into its reasoning. Exact periodicity over a whole window is
+/// what makes this safe: real prose and code never repeat one ≤64-byte chunk for 1 KiB verbatim.
+#[derive(Default)]
+struct RepetitionGuard {
+    tail: Vec<u8>,
+}
+
+impl RepetitionGuard {
+    fn push(&mut self, text: &str) -> bool {
+        self.tail.extend_from_slice(text.as_bytes());
+        if self.tail.len() > 2 * REPETITION_WINDOW_BYTES {
+            self.tail.drain(..self.tail.len() - REPETITION_WINDOW_BYTES);
+        }
+        self.is_looping()
+    }
+
+    fn is_looping(&self) -> bool {
+        let Some(start) = self.tail.len().checked_sub(REPETITION_WINDOW_BYTES) else {
+            return false;
+        };
+        let window = &self.tail[start..];
+        (1..=MAX_REPETITION_PERIOD_BYTES).any(|period| {
+            window[period..]
+                .iter()
+                .zip(window)
+                .all(|(later, earlier)| later == earlier)
+        })
+    }
+}
 
 pub(crate) fn provider_compatible_tool_name(tool_name: &str) -> String {
     let mut sanitized = String::new();
@@ -2929,6 +2975,7 @@ impl Thread {
         let mut intent = CompletionIntent::UserPrompt;
         // Set when a refusal fallback occurs so subsequent iterations use the fallback model.
         let mut refusal_fallback_model: Option<LanguageModel> = None;
+        let is_subagent = this.read_with(cx, |this, _| this.is_subagent())?;
         loop {
             if *cancellation_rx.borrow() {
                 return Ok(());
@@ -3062,8 +3109,15 @@ impl Thread {
             let mut early_tool_results: Vec<(usize, LanguageModelToolResult)> = Vec::new();
             let mut cancelled = false;
             let mut had_refusal = false;
+            let mut repetition_guard = RepetitionGuard::default();
+            let mut model_responded = false;
             loop {
-                // Race between getting the first event, tool completion, and cancellation.
+                let stall_timer = if is_subagent {
+                    Either::Left(cx.background_executor().timer(SUBAGENT_STALL_TIMEOUT))
+                } else {
+                    Either::Right(future::pending::<()>())
+                };
+                // Race between getting the first event, tool completion, cancellation, and a stall.
                 let first_event = futures::select_biased! {
                     _ = cancellation_rx.changed().fuse() => {
                         if *cancellation_rx.borrow() {
@@ -3097,6 +3151,14 @@ impl Thread {
                         }
                         continue;
                     }
+                    // Last, so `select_biased!` lets a ready event or tool result win a tie.
+                    _ = stall_timer.fuse() => {
+                        return Err(anyhow!(
+                            "Subagent stalled: its model sent nothing for {} seconds, so the turn \
+                             was stopped. Spawn it again, or on another model if this repeats.",
+                            SUBAGENT_STALL_TIMEOUT.as_secs()
+                        ));
+                    }
                 };
                 let Some(first_event) = first_event else {
                     break;
@@ -3115,6 +3177,26 @@ impl Thread {
 
                     for event in batch {
                         log::trace!("Received completion event: {:?}", event);
+                        if event.as_ref().is_ok_and(is_model_response) {
+                            model_responded = true;
+                        }
+                        if is_subagent {
+                            if let Ok(
+                                LanguageModelCompletionEvent::Text(text)
+                                | LanguageModelCompletionEvent::Thinking { text, .. },
+                            ) = &event
+                            {
+                                if repetition_guard.push(text) {
+                                    batch_error = Some(anyhow!(
+                                        "Subagent stopped: its output repeated one short pattern \
+                                         for {REPETITION_WINDOW_BYTES} bytes, so the model was \
+                                         looping. Spawn it again, or on another model if this \
+                                         repeats."
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
                         match event {
                             Ok(event) => {
                                 match this.handle_completion_event(
@@ -3233,6 +3315,19 @@ impl Thread {
                 }
                 log::info!("Request refused with no fallback model available");
                 return Err(CompletionError::Refusal.into());
+            }
+
+            // OpenAI-format providers only emit tool calls and `Stop` on the final `finish_reason`
+            // chunk, so a stream that dies before it yields nothing and no error. Without this the
+            // turn would end silently mid-task; as a stream error it is retried, then surfaced. An
+            // explicit `Stop` with no text is the model's own choice and still ends the turn.
+            if !cancelled && error.is_none() && !model_responded {
+                log::warn!(
+                    "Completion ended with no text, tool call or stop reason; treating it as a dropped stream"
+                );
+                error = Some(LanguageModelCompletionError::StreamEndedUnexpectedly {
+                    provider: model.provider_name(),
+                });
             }
 
             let end_turn = tool_results.is_empty() && early_tool_results.is_empty();
@@ -7194,6 +7289,53 @@ mod tests {
     use serde_json::json;
     use settings::LanguageModelProviderSetting;
     use std::sync::Arc;
+
+    #[test]
+    fn test_repetition_guard_flags_the_leaked_tool_call_loop() {
+        let mut guard = RepetitionGuard::default();
+        assert!(!guard.push("Let me check the file.\n<invoke name=\"terminal\">\n"));
+        let looped = (0..200).any(|_| guard.push("</parameter>\n</invoke>\n"));
+        assert!(looped);
+    }
+
+    #[test]
+    fn test_repetition_guard_flags_a_loop_split_across_chunks() {
+        let mut guard = RepetitionGuard::default();
+        let looped = "</parameter>\n</invoke>\n"
+            .repeat(60)
+            .as_bytes()
+            .chunks(7)
+            .any(|chunk| guard.push(std::str::from_utf8(chunk).unwrap_or_default()));
+        assert!(looped);
+    }
+
+    #[test]
+    fn test_repetition_guard_allows_long_varied_output() {
+        let mut guard = RepetitionGuard::default();
+        for line in 0..400 {
+            assert!(!guard.push(&format!("fn handler_{line}() -> usize {{ {line} * 2 }}\n")));
+        }
+    }
+
+    #[test]
+    fn test_repetition_guard_allows_a_markdown_table() {
+        let mut guard = RepetitionGuard::default();
+        assert!(!guard.push("| file | lines | owner |\n|---|---|---|\n"));
+        for row in 0..60 {
+            assert!(!guard.push(&format!(
+                "| src/module_{row}.rs | {} | team-{} |\n",
+                row * 7,
+                row % 5
+            )));
+        }
+    }
+
+    #[test]
+    fn test_repetition_guard_needs_a_full_window() {
+        let mut guard = RepetitionGuard::default();
+        assert!(!guard.push(&"ab".repeat(REPETITION_WINDOW_BYTES / 2 - 1)));
+        assert!(guard.push("ab"));
+    }
 
     #[gpui::test]
     async fn test_tool_call_events_preserve_opaque_id_storage(cx: &mut TestAppContext) {
