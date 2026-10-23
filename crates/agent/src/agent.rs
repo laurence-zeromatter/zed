@@ -9828,6 +9828,10 @@ mod internal_tests {
         turn.send_start_message_with_usage(100);
         cx.run_until_parked();
 
+        turn.fake.send_last_event(
+            &turn.model,
+            LanguageModelCompletionEvent::Stop(language_model::StopReason::EndTurn),
+        );
         turn.fake.end_last(&turn.model);
         send.await.unwrap();
         cx.run_until_parked();

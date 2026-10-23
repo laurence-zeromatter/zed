@@ -1973,6 +1973,10 @@ async fn test_mcp_tools(cx: &mut TestAppContext) {
             },),
         ]
     );
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+    );
     fake.end_last(&model);
     events.collect::<Vec<_>>().await;
 }
@@ -2202,6 +2206,10 @@ async fn test_mcp_tool_multi_content_response(cx: &mut TestAppContext) {
     assert_eq!(
         tool_result.content[2],
         language_model::LanguageModelToolResultContent::Text(Arc::from("Some more text"))
+    );
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
     );
     fake.end_last(&model);
     events.collect::<Vec<_>>().await;
@@ -6899,6 +6907,265 @@ async fn test_max_subagent_depth_prevents_tool_registration(cx: &mut TestAppCont
             "subagent tool should not be present at max depth"
         );
     });
+}
+
+#[gpui::test]
+async fn test_empty_completion_is_retried_not_treated_as_end_of_turn(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        thread,
+        fake,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hi"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    fake.end_last(&model);
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_secs(60));
+    cx.run_until_parked();
+    fake.send_last_text(&model, "Done.");
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    let mut retries = 0;
+    let mut errors = Vec::new();
+    while let Some(Some(event)) = events.next().now_or_never() {
+        match event {
+            Ok(ThreadEvent::Retry(_)) => retries += 1,
+            Err(error) => errors.push(error.to_string()),
+            _ => {}
+        }
+    }
+    assert_eq!(retries, 1);
+    assert_eq!(errors, Vec::<String>::new());
+}
+
+#[gpui::test]
+async fn test_repeated_empty_completions_surface_an_error(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        thread,
+        fake,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hi"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    for _ in 0..2 {
+        fake.end_last(&model);
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(60));
+        cx.run_until_parked();
+    }
+
+    assert!(
+        fake.pending_completions().is_empty(),
+        "a dropped stream is retried once, not again"
+    );
+    let errors = turn_errors(&mut events);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("ended unexpectedly"), "{errors:?}");
+}
+
+#[gpui::test]
+async fn test_completion_with_text_ends_turn_without_retry(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        thread,
+        fake,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hi"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    fake.send_last_text(&model, "Hello.");
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    let retried = std::iter::from_fn(|| events.next().now_or_never().flatten())
+        .any(|event| matches!(event, Ok(ThreadEvent::Retry(_))));
+    assert!(!retried);
+}
+
+#[gpui::test]
+async fn test_explicit_end_turn_without_text_ends_turn_without_retry(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        thread,
+        fake,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hi"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    let events = std::iter::from_fn(|| events.next().now_or_never().flatten()).collect::<Vec<_>>();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Ok(ThreadEvent::Retry(_)))),
+        "an explicit stop is the model ending its turn, not a dropped stream"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Ok(ThreadEvent::Stop(_)))),
+        "the turn should end"
+    );
+}
+
+fn make_subagent(thread: &Entity<Thread>, cx: &mut TestAppContext) {
+    thread.update(cx, |thread, _| {
+        thread.set_subagent_context(SubagentContext {
+            parent_thread_id: acp_v2::SessionId::new("parent-id"),
+            depth: 1,
+        });
+    });
+}
+
+fn turn_errors(events: &mut UnboundedReceiver<Result<ThreadEvent>>) -> Vec<String> {
+    let mut errors = Vec::new();
+    while let Some(Some(event)) = events.next().now_or_never() {
+        if let Err(error) = event {
+            errors.push(error.to_string());
+        }
+    }
+    errors
+}
+
+#[gpui::test]
+async fn test_subagent_turn_stops_when_model_goes_silent(cx: &mut TestAppContext) {
+    let ThreadTest { thread, .. } = setup(cx, TestModel::Fake).await;
+    make_subagent(&thread, cx);
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hi"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    cx.executor()
+        .advance_clock(SUBAGENT_STALL_TIMEOUT + Duration::from_secs(1));
+    cx.run_until_parked();
+
+    let errors = turn_errors(&mut events);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].starts_with("Subagent stalled"), "{errors:?}");
+}
+
+#[gpui::test]
+async fn test_subagent_stall_timer_resets_on_progress(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        thread,
+        fake,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    make_subagent(&thread, cx);
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hi"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let most_of_the_timeout = SUBAGENT_STALL_TIMEOUT - Duration::from_secs(10);
+    cx.executor().advance_clock(most_of_the_timeout);
+    fake.send_last_text(&model, "still working");
+    cx.run_until_parked();
+    cx.executor().advance_clock(most_of_the_timeout);
+    cx.run_until_parked();
+
+    assert_eq!(turn_errors(&mut events), Vec::<String>::new());
+}
+
+#[gpui::test]
+async fn test_root_thread_never_stall_stops(cx: &mut TestAppContext) {
+    let ThreadTest { thread, .. } = setup(cx, TestModel::Fake).await;
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hi"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    cx.executor().advance_clock(SUBAGENT_STALL_TIMEOUT * 3);
+    cx.run_until_parked();
+
+    assert_eq!(turn_errors(&mut events), Vec::<String>::new());
+}
+
+#[gpui::test]
+async fn test_subagent_turn_stops_when_output_loops(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        thread,
+        fake,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    make_subagent(&thread, cx);
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hi"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    for _ in 0..100 {
+        fake.send_last_text(&model, "</parameter>\n</invoke>\n");
+    }
+    cx.run_until_parked();
+
+    let errors = turn_errors(&mut events);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("looping"), "{errors:?}");
+}
+
+#[gpui::test]
+async fn test_root_thread_output_is_not_loop_checked(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        thread,
+        fake,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hi"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    for _ in 0..100 {
+        fake.send_last_text(&model, "</parameter>\n</invoke>\n");
+    }
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    assert_eq!(turn_errors(&mut events), Vec::<String>::new());
 }
 
 #[gpui::test]
