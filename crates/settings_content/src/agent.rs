@@ -1073,6 +1073,11 @@ pub struct ToolPermissionsContent {
     #[serde(alias = "default_mode")]
     pub default: Option<ToolPermissionMode>,
 
+    /// When true, `auto_allow` patterns auto-approve instead of prompting.
+    /// Meant to be toggled from a settings profile.
+    /// Default: false
+    pub auto_mode: Option<bool>,
+
     /// Per-tool permission rules.
     /// Keys are tool names (e.g. terminal, edit_file, fetch) including MCP
     /// tools (e.g. mcp:server_name:tool_name). Any tool name is accepted;
@@ -1115,6 +1120,14 @@ pub struct ToolRulesContent {
     /// removed by a higher-priority layer—only new patterns can be added.
     /// Default: []
     pub always_confirm: Option<ExtendingVec<ToolRegexRule>>,
+
+    /// Regexes for inputs that prompt normally but auto-approve while
+    /// `tool_permissions.auto_mode` is on. Never overrides always_deny or
+    /// always_confirm.
+    /// Patterns accumulate across settings layers (user, project, profile) and cannot be
+    /// removed by a higher-priority layer—only new patterns can be added.
+    /// Default: []
+    pub auto_allow: Option<ExtendingVec<ToolRegexRule>>,
 }
 
 #[with_fallible_options]

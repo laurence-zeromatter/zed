@@ -924,6 +924,7 @@ fn compile_tool_permissions(content: Option<settings::ToolPermissionsContent>) -
     let Some(content) = content else {
         return ToolPermissions::default();
     };
+    let auto_mode = content.auto_mode.unwrap_or(false);
 
     let tools = content
         .tools
@@ -931,7 +932,7 @@ fn compile_tool_permissions(content: Option<settings::ToolPermissionsContent>) -
         .map(|(tool_name, rules_content)| {
             let mut invalid_patterns = Vec::new();
 
-            let (always_allow, allow_errors) = compile_regex_rules(
+            let (mut always_allow, allow_errors) = compile_regex_rules(
                 rules_content.always_allow.map(|v| v.0).unwrap_or_default(),
                 "always_allow",
             );
@@ -943,7 +944,7 @@ fn compile_tool_permissions(content: Option<settings::ToolPermissionsContent>) -
             );
             invalid_patterns.extend(deny_errors);
 
-            let (always_confirm, confirm_errors) = compile_regex_rules(
+            let (mut always_confirm, confirm_errors) = compile_regex_rules(
                 rules_content
                     .always_confirm
                     .map(|v| v.0)
@@ -951,6 +952,19 @@ fn compile_tool_permissions(content: Option<settings::ToolPermissionsContent>) -
                 "always_confirm",
             );
             invalid_patterns.extend(confirm_errors);
+
+            // Folded into the existing lists rather than kept as its own list, so the
+            // decision code is untouched and always_confirm still outranks auto_allow.
+            let (auto_allow, auto_allow_errors) = compile_regex_rules(
+                rules_content.auto_allow.map(|v| v.0).unwrap_or_default(),
+                "auto_allow",
+            );
+            invalid_patterns.extend(auto_allow_errors);
+            if auto_mode {
+                always_allow.extend(auto_allow);
+            } else {
+                always_confirm.extend(auto_allow);
+            }
 
             // Log invalid patterns for debugging. Users will see an error when they
             // attempt to use a tool with invalid patterns in their settings.
@@ -1660,6 +1674,68 @@ mod tests {
         assert!(terminal.always_deny[0].is_match("rm -rf /"));
         assert!(terminal.always_confirm[0].is_match("sudo apt install"));
         assert!(terminal.always_allow[0].is_match("git status"));
+    }
+
+    fn compile_auto_allow_terminal(auto_mode: Option<bool>) -> ToolRules {
+        let mut json = json!({
+            "tools": {
+                "terminal": {
+                    "always_confirm": [{ "pattern": "^git\\s+push" }],
+                    "auto_allow": [{ "pattern": "^gh\\s+workflow\\s+run" }]
+                }
+            }
+        });
+        if let Some(auto_mode) = auto_mode {
+            json["auto_mode"] = json!(auto_mode);
+        }
+        let content: ToolPermissionsContent = serde_json::from_value(json).unwrap();
+        compile_tool_permissions(Some(content))
+            .tools
+            .remove("terminal")
+            .unwrap()
+    }
+
+    #[test]
+    fn test_auto_allow_confirms_when_auto_mode_unset() {
+        let terminal = compile_auto_allow_terminal(None);
+        assert!(terminal.always_allow.is_empty());
+        assert_eq!(terminal.always_confirm.len(), 2);
+        assert!(
+            terminal
+                .always_confirm
+                .iter()
+                .any(|rule| rule.is_match("gh workflow run eval.yml"))
+        );
+    }
+
+    #[test]
+    fn test_auto_allow_confirms_when_auto_mode_off() {
+        let terminal = compile_auto_allow_terminal(Some(false));
+        assert!(terminal.always_allow.is_empty());
+        assert_eq!(terminal.always_confirm.len(), 2);
+    }
+
+    #[test]
+    fn test_auto_allow_allows_when_auto_mode_on_but_keeps_always_confirm() {
+        let terminal = compile_auto_allow_terminal(Some(true));
+        assert_eq!(terminal.always_allow.len(), 1);
+        assert!(terminal.always_allow[0].is_match("gh workflow run eval.yml"));
+        assert_eq!(terminal.always_confirm.len(), 1);
+        assert!(terminal.always_confirm[0].is_match("git push origin main"));
+    }
+
+    #[test]
+    fn test_invalid_auto_allow_regex_is_tracked() {
+        let json = json!({
+            "auto_mode": true,
+            "tools": { "terminal": { "auto_allow": [{ "pattern": "[bad" }] } }
+        });
+        let content: ToolPermissionsContent = serde_json::from_value(json).unwrap();
+        let permissions = compile_tool_permissions(Some(content));
+        let terminal = permissions.tools.get("terminal").unwrap();
+        assert!(terminal.always_allow.is_empty());
+        assert_eq!(terminal.invalid_patterns.len(), 1);
+        assert_eq!(terminal.invalid_patterns[0].rule_type, "auto_allow");
     }
 
     #[test]
