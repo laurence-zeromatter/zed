@@ -4381,16 +4381,22 @@ impl ThreadView {
     }
 
     fn render_subagents_awaiting_permission(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        let awaiting = self.conversation.read(cx).subagents_awaiting_permission(cx);
+        let conversation = self.conversation.read(cx);
+        let awaiting = conversation.subagents_awaiting_permission(cx);
 
         if awaiting.is_empty() {
             return None;
         }
 
-        let awaiting_session_ids: Vec<_> = awaiting
-            .iter()
-            .map(|(session_id, _)| session_id.clone())
-            .collect();
+        let mut awaiting_session_ids = Vec::new();
+        for (session_id, _) in &awaiting {
+            let Some(child) = conversation.child_toward(session_id, &self.session_id, cx) else {
+                continue;
+            };
+            if !awaiting_session_ids.contains(&child) {
+                awaiting_session_ids.push(child);
+            }
+        }
 
         let thread = self.thread.read(cx);
         let entries = thread.entries();

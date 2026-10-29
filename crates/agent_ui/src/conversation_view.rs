@@ -516,6 +516,24 @@ impl Conversation {
             .collect()
     }
 
+    /// Walks up from `session_id` to the ancestor spawned directly by `parent_id`, so a
+    /// grandchild's request can surface on the subagent card the parent's view renders.
+    pub fn child_toward(
+        &self,
+        session_id: &acp_v2::SessionId,
+        parent_id: &acp_v2::SessionId,
+        cx: &App,
+    ) -> Option<acp_v2::SessionId> {
+        let mut current = session_id.clone();
+        loop {
+            let parent = self.threads.get(&current)?.read(cx).parent_session_id()?;
+            if parent == parent_id {
+                return Some(current);
+            }
+            current = parent.clone();
+        }
+    }
+
     /// Returns the first pending tool call request for exactly `session_id`.
     /// Unlike `pending_tool_call`, this does not use the global FIFO pending
     /// request for non-subagent sessions.
@@ -17738,6 +17756,60 @@ pub(crate) mod tests {
                     .pending_tool_call(&session_id, cx)
                     .is_none(),
                 "Expected no pending tool calls after both were authorized"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grandchild_permission_maps_to_direct_child(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection: Rc<dyn AgentConnection> = Rc::new(StubAgentConnection::new());
+        let root_session_id = acp_v2::SessionId::new("root");
+        let child_session_id = acp_v2::SessionId::new("child");
+        let grandchild_session_id = acp_v2::SessionId::new("grandchild");
+        let conversation = cx.update(|cx| {
+            let root =
+                create_test_acp_thread(None, "root", connection.clone(), project.clone(), cx);
+            let child = create_test_acp_thread(
+                Some(root_session_id.clone()),
+                "child",
+                connection.clone(),
+                project.clone(),
+                cx,
+            );
+            let grandchild = create_test_acp_thread(
+                Some(child_session_id.clone()),
+                "grandchild",
+                connection,
+                project,
+                cx,
+            );
+            cx.new(|cx| {
+                let mut conversation = Conversation::default();
+                conversation.register_thread(root, cx);
+                conversation.register_thread(child, cx);
+                conversation.register_thread(grandchild, cx);
+                conversation
+            })
+        });
+        conversation.read_with(cx, |conversation, cx| {
+            assert_eq!(
+                conversation.child_toward(&grandchild_session_id, &root_session_id, cx),
+                Some(child_session_id.clone())
+            );
+            assert_eq!(
+                conversation.child_toward(&grandchild_session_id, &child_session_id, cx),
+                Some(grandchild_session_id.clone())
+            );
+            assert_eq!(
+                conversation.child_toward(&child_session_id, &root_session_id, cx),
+                Some(child_session_id.clone())
+            );
+            assert_eq!(
+                conversation.child_toward(&root_session_id, &child_session_id, cx),
+                None
             );
         });
     }
