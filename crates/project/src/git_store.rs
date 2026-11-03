@@ -8759,11 +8759,21 @@ impl Repository {
         remote: SharedString,
         rebase: bool,
         askpass: AskPassDelegate,
-        _cx: &mut App,
+        cx: &mut Context<Self>,
     ) -> oneshot::Receiver<Result<RemoteCommandOutput>> {
         let askpass_delegates = self.askpass_delegates.clone();
         let askpass_id = util::post_inc(&mut self.latest_askpass_id);
         let id = self.id;
+
+        let updates_tx = self
+            .git_store()
+            .and_then(|git_store| match &git_store.read(cx).state {
+                GitStoreState::Local { downstream, .. } => downstream
+                    .as_ref()
+                    .map(|downstream| downstream.updates_tx.clone()),
+                _ => None,
+            });
+        let this = cx.weak_entity();
 
         let mut status = "git pull".to_string();
         if rebase {
@@ -8777,23 +8787,27 @@ impl Repository {
         self.send_job(
             "pull",
             Some(status.into()),
-            move |git_repo, cx| async move {
+            move |git_repo, mut cx| async move {
                 match git_repo {
                     RepositoryState::Local(LocalRepositoryState {
                         backend,
                         environment,
                         ..
                     }) => {
-                        backend
+                        let result = backend
                             .pull(
                                 branch.as_ref().map(|b| b.to_string()),
                                 remote.to_string(),
                                 rebase,
                                 askpass,
                                 environment.clone(),
-                                cx,
+                                cx.clone(),
                             )
-                            .await
+                            .await;
+                        if result.is_ok() {
+                            Self::refresh_branch_list(&this, backend, updates_tx, &mut cx).await?;
+                        }
+                        result
                     }
                     RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
                         let _askpass_operation =

@@ -1315,7 +1315,13 @@ impl GitRepository for FakeGitRepository {
         _env: Arc<HashMap<String, String>>,
         _cx: AsyncApp,
     ) -> BoxFuture<'_, Result<git::repository::RemoteCommandOutput>> {
-        unimplemented!()
+        async {
+            Ok(git::repository::RemoteCommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+        .boxed()
     }
 
     fn fetch(

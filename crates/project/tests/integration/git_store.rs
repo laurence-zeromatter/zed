@@ -1363,6 +1363,52 @@ mod git_worktrees {
     }
 
     #[gpui::test]
+    async fn test_pull_refreshes_branch_list(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(path!("/root"), json!({ ".git": {}, "file.txt": "content" }))
+            .await;
+        let dot_git = Path::new(path!("/root/.git"));
+        fs.insert_branches(dot_git, &["main", "origin/merged-feature"]);
+
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        cx.executor().run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project.repositories(cx).values().next().unwrap().clone()
+        });
+        let branch_names = |cx: &mut TestAppContext| {
+            repository.read_with(cx, |repository, _| {
+                repository
+                    .branch_list
+                    .iter()
+                    .map(|branch| branch.name().to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert!(branch_names(cx).contains(&"origin/merged-feature".to_string()));
+
+        // No git event: the prune happens inside `git pull`, so nothing but the
+        // pull itself can tell the repository to rescan.
+        fs.with_git_state(dot_git, false, |state| {
+            state.branches.remove("origin/merged-feature");
+        })
+        .unwrap();
+
+        let askpass = askpass::AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {});
+        cx.update(|cx| {
+            repository.update(cx, |repository, cx| {
+                repository.pull(None, "origin".into(), false, askpass, cx)
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        cx.executor().run_until_parked();
+
+        assert_eq!(branch_names(cx), vec!["main".to_string()]);
+    }
+
+    #[gpui::test]
     async fn test_git_worktrees_list_and_create(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.background_executor.clone());

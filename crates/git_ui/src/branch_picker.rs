@@ -1314,39 +1314,59 @@ impl PickerDelegate for BranchListDelegate {
                             let branch_filter = self.branch_filter;
                             let focus_handle = self.focus_handle.clone();
 
-                            this.gap_1().justify_between().child(
-                                PopoverMenu::new("branch-filter-menu")
-                                    .with_handle(self.branch_filter_menu_handle.clone())
-                                    .trigger_with_tooltip(
-                                        self.branch_filter_trigger(),
-                                        self.branch_filter_tooltip(),
-                                    )
-                                    .menu(move |window, cx| {
-                                        Some(branch_filter_menu(
-                                            branch_filter,
-                                            focus_handle.clone(),
-                                            window,
-                                            cx,
-                                        ))
-                                    })
-                                    .map(|this| {
-                                        if editor_bottom {
-                                            this.anchor(gpui::Anchor::BottomRight)
-                                                .attach(gpui::Anchor::TopRight)
-                                                .offset(gpui::Point {
-                                                    x: px(0.0),
-                                                    y: px(-1.0),
-                                                })
-                                        } else {
-                                            this.anchor(gpui::Anchor::TopRight)
-                                                .attach(gpui::Anchor::BottomRight)
-                                                .offset(gpui::Point {
-                                                    x: px(1.0),
-                                                    y: px(1.0),
-                                                })
-                                        }
-                                    }),
-                            )
+                            this.gap_1()
+                                .justify_between()
+                                .child(
+                                    IconButton::new("fetch-branches", IconName::RotateCw)
+                                        .icon_size(IconSize::Small)
+                                        .tooltip({
+                                            let focus_handle = focus_handle.clone();
+                                            move |_, cx| {
+                                                Tooltip::for_action_in(
+                                                    "Fetch and Refresh Branches",
+                                                    &git::Fetch,
+                                                    &focus_handle,
+                                                    cx,
+                                                )
+                                            }
+                                        })
+                                        .on_click(|_, window, cx| {
+                                            window.dispatch_action(git::Fetch.boxed_clone(), cx);
+                                        }),
+                                )
+                                .child(
+                                    PopoverMenu::new("branch-filter-menu")
+                                        .with_handle(self.branch_filter_menu_handle.clone())
+                                        .trigger_with_tooltip(
+                                            self.branch_filter_trigger(),
+                                            self.branch_filter_tooltip(),
+                                        )
+                                        .menu(move |window, cx| {
+                                            Some(branch_filter_menu(
+                                                branch_filter,
+                                                focus_handle.clone(),
+                                                window,
+                                                cx,
+                                            ))
+                                        })
+                                        .map(|this| {
+                                            if editor_bottom {
+                                                this.anchor(gpui::Anchor::BottomRight)
+                                                    .attach(gpui::Anchor::TopRight)
+                                                    .offset(gpui::Point {
+                                                        x: px(0.0),
+                                                        y: px(-1.0),
+                                                    })
+                                            } else {
+                                                this.anchor(gpui::Anchor::TopRight)
+                                                    .attach(gpui::Anchor::BottomRight)
+                                                    .offset(gpui::Point {
+                                                        x: px(1.0),
+                                                        y: px(1.0),
+                                                    })
+                                            }
+                                        }),
+                                )
                         }),
                 )
                 .when(editor_start, |this| {
@@ -2449,7 +2469,9 @@ mod tests {
             branch_list
                 .update_in(cx, |branch_list, window, cx| {
                     branch_list.picker.update(cx, |picker, cx| {
-                        picker.delegate.update_matches(query.to_string(), window, cx)
+                        picker
+                            .delegate
+                            .update_matches(query.to_string(), window, cx)
                     })
                 })
                 .detach();
@@ -2473,7 +2495,10 @@ mod tests {
         assert!(default_list.contains(&"live".to_string()));
         assert!(default_list.contains(&"never-pushed".to_string()));
 
-        assert_eq!(match_names("old-merged", cx), vec!["old-merged".to_string()]);
+        assert_eq!(
+            match_names("old-merged", cx),
+            vec!["old-merged".to_string()]
+        );
     }
 
     #[gpui::test]
